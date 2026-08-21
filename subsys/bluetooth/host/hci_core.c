@@ -3065,6 +3065,8 @@ static const struct event_handler normal_events[] = {
 		      sizeof(struct bt_hci_evt_user_passkey_req)),
 	EVENT_HANDLER(BT_HCI_EVT_INQUIRY_COMPLETE, bt_hci_inquiry_complete,
 		      sizeof(struct bt_hci_evt_inquiry_complete)),
+	/* R103: basic Inquiry Result (0x02) - LCPU sends this instead of 0x22 */
+	EVENT_HANDLER(0x02, bt_hci_inquiry_result, 0),
 	EVENT_HANDLER(BT_HCI_EVT_INQUIRY_RESULT_WITH_RSSI,
 		      bt_hci_inquiry_result_with_rssi,
 		      sizeof(struct bt_hci_evt_inquiry_result_with_rssi)),
@@ -3385,7 +3387,7 @@ static void le_read_resolving_list_size_complete(struct bt_dev *hdev, struct net
 static void probe_inode(const char *tag)
 {
 	int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-	syslog(LOG_INFO, "[probe] %s: open=%d", tag, fd);
+	LOG_INF("%s: open=%d", tag, fd);
 	if (fd >= 0) {
 		close(fd);
 	}
@@ -4430,14 +4432,14 @@ static void rx_work_handler(struct k_work *work)
 	struct bt_dev *hdev = CONTAINER_OF(work, struct bt_dev, rx_work);
 
 	LOG_DBG("dev:%d, Getting net_buf from queue", hdev->dev_id);
-	buf = net_buf_slist_get(&hdev->rx_queue);
-	if (!buf) {
-		return;
-	}
 
-	LOG_DBG("buf %p type %u len %u", buf, bt_buf_get_type(buf), buf->len);
+	/* Drain the queue in one pass: re-submitting this work item from inside
+	 * the handler is not reliably re-scheduled on this port, so events arriving
+	 * while rx_work runs would sit in rx_queue forever. */
+	while ((buf = net_buf_slist_get(&hdev->rx_queue)) != NULL) {
+		LOG_DBG("buf %p type %u len %u", buf, bt_buf_get_type(buf), buf->len);
 
-	switch (bt_buf_get_type(buf)) {
+		switch (bt_buf_get_type(buf)) {
 #if defined(CONFIG_BT_CONN)
 	case BT_BUF_ACL_IN:
 		hci_acl(hdev, buf);
@@ -4451,17 +4453,14 @@ static void rx_work_handler(struct k_work *work)
 	case BT_BUF_EVT:
 		hci_event(hdev, buf);
 		break;
-	default:
-		LOG_ERR("Unknown buf type %u", bt_buf_get_type(buf));
-		net_buf_unref(buf);
-		break;
+		default:
+			LOG_ERR("Unknown buf type %u", bt_buf_get_type(buf));
+			net_buf_unref(buf);
+			break;
+		}
 	}
 
-	/* Schedule the work handler to be executed again if there are
-	 * additional items in the queue. This allows for other users of the
-	 * work queue to get a chance at running, which wouldn't be possible if
-	 * we used a while() loop with a k_yield() statement.
-	 */
+	/* Re-schedule if new items arrived while we were draining. */
 	if (!sys_slist_is_empty(&hdev->rx_queue)) {
 
 #if defined(CONFIG_BT_RECV_WORKQ_SYS)
